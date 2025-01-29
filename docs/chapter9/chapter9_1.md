@@ -2,41 +2,86 @@
 
 &emsp;&emsp;我们日常使用 ChatGPT 等大语言模型（LLM）应用来提升工作效率，或者通过模型厂商提供的 API 来开发项目。那么，这些服务是如何确保在生产环境中应对每分钟数万次乃至更多请求的同时，还能为全球用户提供始终如一的良好体验呢？这离不开先进的**并发处理技术**的支持。
 
-## 9.1.1 推理过程
+## 1. 推理过程
 
 &emsp;&emsp;LLM 推理分为两部分: 预填充阶段（Prefill） 和生成阶段（Generation）。
 
-### 9.1.1.1 预填充阶段
+### 1.1 预填充阶段
 
-&emsp;&emsp;在预填充阶段，Transformer 模型会先对输入的句子进行编码。Transformer 使用自注意力机制（self-attention）来处理输入序列，捕捉不同单词之间的关系。模型会将输入句子的每个单词转换成词嵌入（embedding），然后通过多层的注意力机制和前馈神经网络进行处理，生成句子的内部表示。
+&emsp;&emsp;在预填充阶段所做的事有：处理输入 prompt 的所有 tokens 并行计算所有输入 tokens 的 attention，生成并缓存 Key-Value（KV cache）。通常耗时较长，但只需执行一次。
 
-举个例子：
+### 1.2 生成阶段
 
-#### 这里应该画一个示意图
+&emsp;&emsp;该阶段则是自回归生成每个新 token，使用之前生成的 KV cache，只需计算最新 token 的 attention。每个 token 耗时较短，但由于 Transformer 的自回归特性需要串行执行。
 
-    用户输入：“你好，今天的天气怎么样？”
+&emsp;&emsp;模型从输入序列（例如 “Artificial Intelligence is”）开始，通过多层网络计算生成下一个单词（如 “the”）。每次生成一个新单词后，将其加入到输入序列中，作为下一次推理的输入。这个循环过程一直持续，直到达到预设的最大长度（如 2048 tokens）或生成特定结束标记（如 `<end of sequence>`）。
 
-Transformer 会将这句话中的每个词转换成词嵌入，并使用自注意力机制捕捉句子中每个词之间的关系，生成一个上下文感知的表示。
+![](./images/llm-inference.png)
 
-### 9.1.1.2 生成阶段
+&emsp;&emsp;由于 Transformer 的自回归特性，其推理是逐步的，每一步都依赖上下文和历史生成结果。因此还需要先前所有 tokens 的表示。
 
-在生成阶段，Transformer 使用解码器部分，根据预填充阶段生成的上下文表示来生成输出。生成过程通常是逐词进行的，每生成一个词，模型会将其作为输入，再次使用注意力机制更新上下文表示，直到生成完整的回复。
+## 2. KV-Cache
+GPT 8K v.s. 32k, input/output API 价格是翻倍的关系
 
-接着上面的输入示例，模型在生成阶段会逐词输出：
+在训练过程中，Attention 机制会计算查询（Query）、键（Key）和值（Value）矩阵的所有元素之间的关系。这意味着模型会使用**完整的 QKV 矩阵** 来计算注意力分数和加权和，从而生成所有可能的 next token。
 
-    “今天的天气很好，阳光明媚，适合出门活动。”
+![](./images/kv-cache.png)
+
+而在推理过程中我们只关心预测 next token，为了提高效率，只需要计算当前最尾的一个查询向量（Q[-1]）与所有的键向量（K[:]）和值向量（V[:]）之间的关系。通过计算好的 k 和 v 值，我们可以用空间换时间。
+
+无 kv-cache 时,
+
+```python
+idx = cat(idx, next_idx)
+```
+
+开启 kv-cache 后,
+
+```python
+idx = next_idx
+```
+
+![](./images/kv.png)
+
+更详细的实现如下：
+
+```python
+# 训练时预分配 cache 空间
+self.cached_keys = torch.zeros(
+    (max_batch_size, max_sequence_length, num_attention_heads, attention_dim)
+)
+self.cached_values = torch.zeros(
+    (max_batch_size, max_sequence_length, num_attention_heads, attention_dim)
+)
+
+# 推理时在 forward 中:
+# 1. 计算当前输入的 QKV
+query = self.query_proj(x).view(batch_size, seq_length, num_heads, attention_dim)
+key = self.key_proj(x).view(batch_size, seq_length, num_heads, attention_dim)
+value = self.value_proj(x).view(batch_size, seq_length, num_heads, attention_dim)
+
+# 2. cache
+if using_cache and not self.training:
+    # 将新计算的 key,value 存入 cache 对应位置
+    self.cached_keys[:batch_size, start_position:start_position + seq_length] = key
+    self.cached_values[:batch_size, start_position:start_position + seq_length] = value
     
-模型会先生成“今天”，然后将“今天”作为输入继续生成“的”，接着是“天气”，依此类推，直到生成完整的句子。
+    # 获取包含历史和当前的完整 key,value 序列
+    key = self.cached_keys[:batch_size, :start_position + seq_length]
+    value = self.cached_values[:batch_size, :start_position + seq_length]
+```
 
-## 9.1.2 重要指标
+因此，高效管理 KV-Cache 是实现高吞吐量部署服务的关键，我们会在 **9.2 节** 中详细讨论。
+
+## 3. 重要指标
 
 &emsp;&emsp;为了评估 LLM 的并发推理能力，我们最感兴趣的指标是**延迟**（latency）和**吞吐量**（throughput）。
 
-### 9.1.2.1 延迟
+### 3.1 延迟
 
 &emsp;&emsp;延迟是评价 LLM 对用户查询给出反馈速度的标尺，塑造了用户对生成型 AI 应用的直观体验。因此在即时交互场景中，低延迟极为关键。为了全面评估模型延迟，可采纳以下几种度量方式：
 
-#### 1. **TTFT**（Time to First Token）
+#### 3.1.1 **TTFT**（Time to First Token）
 
 &emsp;&emsp;即从请求发出到接收首个回答 token 的时间间隔。
 
@@ -48,13 +93,13 @@ Transformer 会将这句话中的每个词转换成词嵌入，并使用自注�
 
 &emsp;&emsp;这一指标在“在线流式输出模式”下尤为重要，因为它直接影响用户感知的响应速度。
 
-#### 2. **TPOT**（Time per Output Token）
+#### 3.1.2 **TPOT**（Time per Output Token）
 
 &emsp;&emsp;即除了首个 token 外，输出每个 token 的平均时长。
 
 &emsp;&emsp;较短的 TPOT 可以提高系统的整体响应速度，特别是在需要生成大量文本的情况下，如离线批处理服务。
 
-#### 3. 总体延迟
+#### 3.1.3 总体延迟
 
 &emsp;&emsp;指的是模型的**端到端延迟**：从用户最初输入提示到接收到模型完成的输出之间的时间跨度。
 
@@ -72,15 +117,15 @@ $$总体延迟 =  TTFT + (TPOT \times 要生成的\:token\:数量)$$
   
 ![](./images/latency.png)
 
-### 9.1.2.2 吞吐量
+### 3.2 吞吐量
 
 &emsp;&emsp;LLM 的“吞吐量”指标衡量的是在给定时间范围内它可以处理的请求数量或产生输出的数量。通常通过两种方式来衡量：**每秒请求数（QPS）** 和 **每秒输出 tokens 数（TPS）**，你一般可以在模型供应商的开发文档中找到这两个指标。
 
-#### 1. QPS
+#### 3.2.1 QPS
 
 &emsp;&emsp;这一指标取决于模型的总生成时间和同时处理的请求数量，即模型处理并发请求的能力如何。然而，总生成时间会根据模型输入和输出的长度而变化。
 
-#### 2. TPS
+#### 3.2.2 TPS
 
 &emsp;&emsp;由于 QPS 受总生成时间的影响，而总生成时间又依据模型输出的长度（及较小程度上输入的长度），TPS 成为了衡量吞吐量更常用的指标。
 
@@ -88,65 +133,32 @@ $$总体延迟 =  TTFT + (TPOT \times 要生成的\:token\:数量)$$
 
 $$TPS = (要生成的\:token\:数量) / 延迟$$
 
-## 9.1.3 推理框架
+## 4 推理框架
 
 &emsp;&emsp;为了优化 Transformer 模型的推理性能，出现了各种推理框架。
 
-&emsp;&emsp;推理框架的主要目标是优化模型的推理过程，以提高效率和降低资源消耗。以下是一些常见的推理框架及其优化方法，其中部分在前面几章有相关介绍：
+&emsp;&emsp;推理框架的主要目标是优化模型的推理过程，以提高效率和降低资源消耗。以下是一些常见的推理框架/引擎的优化方法，其中部分在前面几章有相关介绍：
 
-### 9.1.3.1 模型压缩
+### 4.1 模型压缩
 
 - 量化：将模型参数从浮点数转换为低精度表示（如 INT8），以减少计算量和内存占用。
 剪枝：移除模型中不重要的权重或神经元，以减少模型大小和计算复杂度。
 - 蒸馏：使用一个较小的“学生”模型来学习和模仿一个较大的“教师”模型的行为，从而在保持性能的同时减少模型大小。
   
-###  9.1.3.2 并行化和分布式计算：
+### 4.2 并行化和分布式计算：
 
 - 数据并行：将数据分成多个小批次，并行处理以提高吞吐量。
 - 模型并行：将模型分成多个部分，分布在不同的计算节点上并行处理。
-- 硬件加速：使用专门的硬件（如 GPU、TPU）并结合高性能算子（如 CUDA、Triton）加速模型推理过程。
+- 硬件加速：使用专门的硬件（如 GPU、TPU）并结合高性能算子（如 CUDA、OpneAI Triton）加速模型推理过程。
 
-###  9.1.3.3 缓存和重用
+### 4.3 缓存和重用
 
-缓存中间结果，以减少重复计算。
-
+高效缓存、管理中间计算结果甚至是直接存储常见输入结果，以减少重复计算。
 
 下面是 BentoML 对几大推理框架的性能测评，以Llama3-8b 部署为例：
 
 ![](./images/bentoml_llama3_8b.png)
 
-
-## 9.1.4 本节大纲（待补充）
-
-&emsp;&emsp;本节将详细探讨并发处理在大语言模型部署中的关键角色，并将内容划分为以下三大部分：
-
-## 1. 异步处理
-
-&emsp;&emsp; 异步处理是提升并发能力的关键之一。
-
-&emsp;&emsp; 会接触到：
-
-- 通过使用**异步队列**来处理网络请求，可以有效地提高系统的响应速度和处理能力。
-
-- 在 Nvidia Triton Server 中部署 vLLM（因为不太熟悉 nv 的东西，估计会改动项目）
-
-- LM Deploy
-
-- LightLLM perhaps
-
-## 2. 批处理
-
-批处理技术在大语言模型的高效运作中不可或缺。
-
-- vLLM 通过动态批处理（dynamic batching）和 pagedattention 来优化性能。
-
-## 3. 分布式
-
-- 分布式处理是应对大规模并发请求的另一重要手段。DeepSpeed-fastgen 是一个优秀的分布式解决方案
-
-- 在 vLLM 中，中央调度器起到了协调各个分布式组件的作用。
-
-- 此外，Ray 也提供了强大的分布式部署能力。结合 DeepSpeed 和 Ray，可以简单、快速、高效地微调和部署大型语言模型。
 
 ## 参考文章
 
